@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Batch IGC to KMZ converter for paragliding tracklogs."""
 
+import colorsys
 import os
 import subprocess
 import sys
@@ -148,10 +149,11 @@ def write_kmz(kml_tree, output_path):
         zf.writestr("doc.kml", kml_bytes)
 
 
-def convert_file(igc_path, color_kml):
+def convert_file(igc_path, color_kml, output_path=None):
     """Convert a single IGC file to KMZ. Returns (output_path, error_or_None)."""
     name = os.path.splitext(os.path.basename(igc_path))[0]
-    output_path = os.path.splitext(igc_path)[0] + ".kmz"
+    if output_path is None:
+        output_path = os.path.splitext(igc_path)[0] + ".kmz"
 
     try:
         data = parse_igc(igc_path)
@@ -206,36 +208,249 @@ def show_alert_macos(title, message):
     subprocess.run(["osascript", "-e", script], capture_output=True)
 
 
-def main():
-    # File picker
-    files = pick_files_macos()
-    if not files:
-        sys.exit(0)
+def pick_mode_macos():
+    """Ask user to select files, a folder, or merge KMZ. Returns 'files', 'folder', or 'merge'."""
+    script = (
+        'display dialog "Convert individual IGC files, an entire folder, or merge existing KMZ files?" '
+        'with title "IGC to KMZ Converter" '
+        'buttons {"Select Files", "Select Folder", "Merge KMZ"} '
+        'default button "Select Files"'
+    )
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    if "Merge KMZ" in result.stdout:
+        return "merge"
+    if "Select Folder" in result.stdout:
+        return "folder"
+    return "files"
 
-    # Color picker
-    hex_color = pick_color_macos()
-    if hex_color is None:
-        sys.exit(0)
-    color_kml = rgb_hex_to_kml(hex_color)
 
-    # Convert
+def pick_folder_macos():
+    """Native macOS folder picker via AppleScript. Returns POSIX path or None."""
+    script = (
+        'set chosenFolder to choose folder with prompt "Select folder containing IGC subfolders"\n'
+        'return POSIX path of chosenFolder'
+    )
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def generate_colors(n):
+    """Return n visually distinct hex colors by stepping around the HSV hue wheel."""
+    if n == 0:
+        return []
+    colors = []
+    for i in range(n):
+        hue = i / n
+        r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+        colors.append(f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}")
+    return colors
+
+
+def convert_folder(folder_path):
+    """Convert all IGC files in subfolders, auto-assigning one color per subfolder."""
+    folder_path = folder_path.rstrip("/")
+    folder_name = os.path.basename(folder_path)
+    parent_dir = os.path.dirname(folder_path)
+    output_root = os.path.join(parent_dir, folder_name + "_kmz")
+
+    # Scan for subfolders with IGC files and root-level IGC files
+    groups = {}  # subfolder_name -> list of igc paths
+    root_files = []
+    for entry in sorted(os.listdir(folder_path)):
+        entry_path = os.path.join(folder_path, entry)
+        if os.path.isdir(entry_path):
+            igc_files = sorted(
+                os.path.join(entry_path, f)
+                for f in os.listdir(entry_path)
+                if f.lower().endswith(".igc")
+            )
+            if igc_files:
+                groups[entry] = igc_files
+        elif entry.lower().endswith(".igc"):
+            root_files.append(entry_path)
+
+    if root_files:
+        groups[""] = root_files  # empty string key = root level
+
+    if not groups:
+        show_alert_macos("No Files Found", "No IGC files found in the selected folder or its subfolders.")
+        return
+
+    # Generate colors — one per group
+    group_names = sorted(groups.keys())
+    colors = generate_colors(len(group_names))
+    color_map = dict(zip(group_names, colors))
+
+    # Create output root
+    os.makedirs(output_root, exist_ok=True)
+
+    total = sum(len(files) for files in groups.values())
     success = 0
     errors = []
-    for i, f in enumerate(files, 1):
-        print(f"[{i}/{len(files)}] Converting {os.path.basename(f)}...")
-        out, err = convert_file(f, color_kml)
-        if err:
-            errors.append(f"{os.path.basename(f)}: {err}")
-            print(f"  ERROR: {err}")
-        else:
-            success += 1
-            print(f"  -> {os.path.basename(out)}")
+    count = 0
+
+    for group_name in group_names:
+        igc_files = groups[group_name]
+        hex_color = color_map[group_name]
+        color_kml = rgb_hex_to_kml(hex_color)
+        display_name = group_name if group_name else "(root)"
+        print(f"\n--- {display_name} [{hex_color}] ---")
+
+        # Create output subfolder
+        out_dir = os.path.join(output_root, group_name) if group_name else output_root
+        os.makedirs(out_dir, exist_ok=True)
+
+        for igc_path in igc_files:
+            count += 1
+            basename = os.path.splitext(os.path.basename(igc_path))[0]
+            out_path = os.path.join(out_dir, basename + ".kmz")
+            print(f"[{count}/{total}] Converting {os.path.basename(igc_path)}...")
+            out, err = convert_file(igc_path, color_kml, output_path=out_path)
+            if err:
+                errors.append(f"{os.path.basename(igc_path)}: {err}")
+                print(f"  ERROR: {err}")
+            else:
+                success += 1
+                print(f"  -> {os.path.basename(out)}")
 
     # Summary
-    msg = f"Converted {success}/{len(files)} files successfully."
+    msg = f"Converted {success}/{total} files successfully.\nOutput: {output_root}"
     if errors:
         msg += f"\n\n{len(errors)} error(s):\n" + "\n".join(errors)
     show_alert_macos("Conversion Complete", msg)
+
+
+def merge_kmz_folder(folder_path):
+    """Merge all KMZ files in subfolders into a single combined KMZ."""
+    folder_path = folder_path.rstrip("/")
+    folder_name = os.path.basename(folder_path)
+    parent_dir = os.path.dirname(folder_path)
+
+    ns = "http://www.opengis.net/kml/2.2"
+
+    # Scan for subfolders with KMZ files and root-level KMZ files
+    groups = {}  # subfolder_name -> list of kmz paths
+    root_files = []
+    for entry in sorted(os.listdir(folder_path)):
+        entry_path = os.path.join(folder_path, entry)
+        if os.path.isdir(entry_path):
+            kmz_files = sorted(
+                os.path.join(entry_path, f)
+                for f in os.listdir(entry_path)
+                if f.lower().endswith(".kmz")
+            )
+            if kmz_files:
+                groups[entry] = kmz_files
+        elif entry.lower().endswith(".kmz"):
+            root_files.append(entry_path)
+
+    if root_files:
+        groups["(root)"] = root_files
+
+    if not groups:
+        show_alert_macos("No Files Found", "No KMZ files found in the selected folder or its subfolders.")
+        return
+
+    # Build combined KML
+    kml = ET.Element("kml", xmlns=ns)
+    doc = ET.SubElement(kml, "Document")
+    ET.SubElement(doc, "name").text = folder_name
+
+    total_files = 0
+    for group_name in sorted(groups.keys()):
+        folder_el = ET.SubElement(doc, "Folder")
+        ET.SubElement(folder_el, "name").text = group_name
+
+        for kmz_path in groups[group_name]:
+            total_files += 1
+            file_prefix = os.path.splitext(os.path.basename(kmz_path))[0] + "_"
+            print(f"  Adding {os.path.basename(kmz_path)}...")
+
+            try:
+                with zipfile.ZipFile(kmz_path, "r") as zf:
+                    with zf.open("doc.kml") as kml_file:
+                        inner_tree = ET.parse(kml_file)
+            except Exception as e:
+                print(f"  ERROR reading {os.path.basename(kmz_path)}: {e}")
+                continue
+
+            inner_root = inner_tree.getroot()
+            # Find Document element (handle namespace)
+            inner_doc = inner_root.find(f"{{{ns}}}Document")
+            if inner_doc is None:
+                inner_doc = inner_root.find("Document")
+            if inner_doc is None:
+                continue
+
+            # Copy Style elements with prefixed IDs
+            for style in inner_doc.findall(f"{{{ns}}}Style"):
+                old_id = style.get("id", "")
+                style.set("id", file_prefix + old_id)
+                folder_el.append(style)
+
+            # Copy Placemarks with updated styleUrl references
+            for pm in inner_doc.findall(f"{{{ns}}}Placemark"):
+                style_url = pm.find(f"{{{ns}}}styleUrl")
+                if style_url is not None and style_url.text and style_url.text.startswith("#"):
+                    style_url.text = "#" + file_prefix + style_url.text[1:]
+                folder_el.append(pm)
+
+    output_path = os.path.join(parent_dir, folder_name + "_merged.kmz")
+    kml_tree = ET.ElementTree(kml)
+    write_kmz(kml_tree, output_path)
+
+    msg = f"Merged {total_files} KMZ files into:\n{output_path}"
+    print(f"\n{msg}")
+    show_alert_macos("Merge Complete", msg)
+
+
+def main():
+    # Mode selection
+    mode = pick_mode_macos()
+    if mode is None:
+        sys.exit(0)
+
+    if mode == "merge":
+        folder = pick_folder_macos()
+        if not folder:
+            sys.exit(0)
+        merge_kmz_folder(folder)
+    elif mode == "folder":
+        folder = pick_folder_macos()
+        if not folder:
+            sys.exit(0)
+        convert_folder(folder)
+    else:
+        # Existing file flow
+        files = pick_files_macos()
+        if not files:
+            sys.exit(0)
+
+        hex_color = pick_color_macos()
+        if hex_color is None:
+            sys.exit(0)
+        color_kml = rgb_hex_to_kml(hex_color)
+
+        success = 0
+        errors = []
+        for i, f in enumerate(files, 1):
+            print(f"[{i}/{len(files)}] Converting {os.path.basename(f)}...")
+            out, err = convert_file(f, color_kml)
+            if err:
+                errors.append(f"{os.path.basename(f)}: {err}")
+                print(f"  ERROR: {err}")
+            else:
+                success += 1
+                print(f"  -> {os.path.basename(out)}")
+
+        msg = f"Converted {success}/{len(files)} files successfully."
+        if errors:
+            msg += f"\n\n{len(errors)} error(s):\n" + "\n".join(errors)
+        show_alert_macos("Conversion Complete", msg)
 
 
 if __name__ == "__main__":
