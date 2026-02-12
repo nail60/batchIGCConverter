@@ -392,8 +392,11 @@ def merge_kmz_folder(folder_path):
                 style.set("id", file_prefix + old_id)
                 folder_el.append(style)
 
-            # Copy Placemarks with updated styleUrl references
+            # Copy Placemarks with updated styleUrl references (skip Takeoff/Landing pins)
             for pm in inner_doc.findall(f"{{{ns}}}Placemark"):
+                pm_name = pm.find(f"{{{ns}}}name")
+                if pm_name is not None and pm_name.text in ("Takeoff", "Landing"):
+                    continue
                 style_url = pm.find(f"{{{ns}}}styleUrl")
                 if style_url is not None and style_url.text and style_url.text.startswith("#"):
                     style_url.text = "#" + file_prefix + style_url.text[1:]
