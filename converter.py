@@ -251,24 +251,133 @@ def pick_color_macos():
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
-def pick_tolerance_macos():
-    """Ask user for track simplification tolerance via AppleScript. Returns float or None."""
+def pick_compress_macos():
+    """Ask user whether to compress tracks. Returns True, False, or None if cancelled."""
     script = (
-        'display dialog "Simplify tracks? Enter tolerance in meters (0 = no simplification):" '
-        'default answer "10" '
-        'with title "Track Simplification"'
+        'display dialog "Compress tracks?\\n\\n'
+        'This simplifies GPS tracklogs to reduce the number of points." '
+        'with title "Track Compression" '
+        'buttons {"Cancel", "Skip", "Compress Tracks"} '
+        'default button "Compress Tracks"'
     )
     result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
     if result.returncode != 0:
         return None
-    # Output: "button returned:OK, text returned:10"
-    for part in result.stdout.strip().split(","):
-        if "text returned:" in part:
-            try:
-                return float(part.split("text returned:")[1].strip())
-            except ValueError:
-                return None
+    if "Compress Tracks" in result.stdout:
+        return True
+    if "Skip" in result.stdout:
+        return False
     return None
+
+
+def extract_points_from_kmz_folder(folder_path):
+    """Extract all track point lists from KMZ files in a folder structure."""
+    ns = "http://www.opengis.net/kml/2.2"
+    all_points = []
+
+    for entry in sorted(os.listdir(folder_path)):
+        entry_path = os.path.join(folder_path, entry)
+        kmz_files = []
+        if os.path.isdir(entry_path):
+            kmz_files = [
+                os.path.join(entry_path, f)
+                for f in os.listdir(entry_path)
+                if f.lower().endswith(".kmz")
+            ]
+        elif entry.lower().endswith(".kmz"):
+            kmz_files = [entry_path]
+
+        for kmz_path in kmz_files:
+            try:
+                with zipfile.ZipFile(kmz_path, "r") as zf:
+                    with zf.open("doc.kml") as kml_file:
+                        tree = ET.parse(kml_file)
+                root = tree.getroot()
+                doc = root.find(f"{{{ns}}}Document") or root.find("Document")
+                if doc is None:
+                    continue
+                for pm in doc.findall(f"{{{ns}}}Placemark"):
+                    pm_name = pm.find(f"{{{ns}}}name")
+                    if pm_name is not None and pm_name.text in ("Takeoff", "Landing"):
+                        continue
+                    ls = pm.find(f"{{{ns}}}LineString")
+                    if ls is None:
+                        continue
+                    coords_el = ls.find(f"{{{ns}}}coordinates")
+                    if coords_el is None or not coords_el.text:
+                        continue
+                    points = []
+                    for triplet in coords_el.text.strip().split():
+                        parts = triplet.split(",")
+                        if len(parts) >= 3:
+                            points.append((float(parts[1]), float(parts[0]), float(parts[2])))
+                    if points:
+                        all_points.append(points)
+            except Exception:
+                continue
+
+    return all_points
+
+
+def pick_tolerance_macos(all_point_lists):
+    """Ask user for simplification tolerance, showing before/after point counts.
+
+    Args:
+        all_point_lists: list of point lists (each a list of (lat, lon, alt) tuples).
+
+    Returns:
+        Tolerance as float, or None if cancelled.
+    """
+    total_points = sum(len(pts) for pts in all_point_lists)
+    default_val = "10"
+
+    while True:
+        script = (
+            f'display dialog "Total track points: {total_points:,}\\n\\n'
+            f'Enter simplification tolerance in meters\\n(0 = no simplification):" '
+            f'default answer "{default_val}" '
+            f'with title "Track Simplification"'
+        )
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+        if result.returncode != 0:
+            return None
+
+        tolerance = None
+        for part in result.stdout.strip().split(","):
+            if "text returned:" in part:
+                try:
+                    tolerance = float(part.split("text returned:")[1].strip())
+                except ValueError:
+                    pass
+
+        if tolerance is None:
+            return None
+
+        if tolerance == 0:
+            return 0.0
+
+        # Calculate simplified point count and show confirmation
+        simplified_total = sum(len(simplify_track(pts, tolerance)) for pts in all_point_lists)
+        reduction = (1 - simplified_total / total_points) * 100 if total_points > 0 else 0
+
+        confirm_script = (
+            f'display dialog "Before: {total_points:,} points\\n'
+            f'After: {simplified_total:,} points\\n'
+            f'Reduction: {reduction:.0f}%\\n\\n'
+            f'Apply {tolerance}m tolerance?" '
+            f'with title "Confirm Simplification" '
+            f'buttons {{"Cancel", "Re-enter", "Apply"}} '
+            f'default button "Apply"'
+        )
+        confirm_result = subprocess.run(["osascript", "-e", confirm_script], capture_output=True, text=True)
+        if confirm_result.returncode != 0:
+            return None
+        if "Apply" in confirm_result.stdout:
+            return tolerance
+        if "Re-enter" in confirm_result.stdout:
+            default_val = str(tolerance)
+            continue
+        return None
 
 
 def show_alert_macos(title, message):
@@ -510,9 +619,15 @@ def main():
         folder = pick_folder_macos()
         if not folder:
             sys.exit(0)
-        tolerance = pick_tolerance_macos()
-        if tolerance is None:
+        compress = pick_compress_macos()
+        if compress is None:
             sys.exit(0)
+        tolerance = 0
+        if compress:
+            all_point_lists = extract_points_from_kmz_folder(folder)
+            tolerance = pick_tolerance_macos(all_point_lists)
+            if tolerance is None:
+                sys.exit(0)
         merge_kmz_folder(folder, tolerance_m=tolerance)
     elif mode == "folder":
         folder = pick_folder_macos()
@@ -530,9 +645,15 @@ def main():
             sys.exit(0)
         color_kml = rgb_hex_to_kml(hex_color)
 
-        tolerance = pick_tolerance_macos()
-        if tolerance is None:
+        compress = pick_compress_macos()
+        if compress is None:
             sys.exit(0)
+        tolerance = 0
+        if compress:
+            all_point_lists = [parse_igc(f)["points"] for f in files]
+            tolerance = pick_tolerance_macos(all_point_lists)
+            if tolerance is None:
+                sys.exit(0)
 
         success = 0
         errors = []
