@@ -78,6 +78,56 @@ def rgb_hex_to_kml(hex_color, alpha=255):
     return f"{alpha:02x}{b:02x}{g:02x}{r:02x}"
 
 
+def simplify_track(points, tolerance_m):
+    """Simplify a track using the Ramer-Douglas-Peucker algorithm.
+
+    Args:
+        points: list of (lat, lon, alt) tuples.
+        tolerance_m: tolerance in meters.
+
+    Returns:
+        Simplified list of (lat, lon, alt) tuples.
+    """
+    if len(points) <= 2 or tolerance_m <= 0:
+        return points
+
+    tolerance = tolerance_m / 111_000  # approximate degrees
+
+    def _perpendicular_distance(point, start, end):
+        """Perpendicular distance from point to line segment (start, end) in lat/lon."""
+        dx = end[1] - start[1]
+        dy = end[0] - start[0]
+        if dx == 0 and dy == 0:
+            return ((point[0] - start[0]) ** 2 + (point[1] - start[1]) ** 2) ** 0.5
+        t = ((point[0] - start[0]) * dy + (point[1] - start[1]) * dx) / (dy * dy + dx * dx)
+        t = max(0, min(1, t))
+        proj_lat = start[0] + t * dy
+        proj_lon = start[1] + t * dx
+        return ((point[0] - proj_lat) ** 2 + (point[1] - proj_lon) ** 2) ** 0.5
+
+    def _rdp(pts):
+        if len(pts) <= 2:
+            return pts
+
+        # Find point with max distance from line between first and last
+        max_dist = 0
+        max_idx = 0
+        for i in range(1, len(pts) - 1):
+            d = _perpendicular_distance(pts[i], pts[0], pts[-1])
+            if d > max_dist:
+                max_dist = d
+                max_idx = i
+
+        if max_dist > tolerance:
+            left = _rdp(pts[: max_idx + 1])
+            right = _rdp(pts[max_idx:])
+            return left[:-1] + right
+        else:
+            return [pts[0], pts[-1]]
+
+    return _rdp(points)
+
+
 def build_kml(track_data, name, color_kml):
     """Build KML XML for a single flight track."""
     kml = ET.Element("kml", xmlns="http://www.opengis.net/kml/2.2")
@@ -149,7 +199,7 @@ def write_kmz(kml_tree, output_path):
         zf.writestr("doc.kml", kml_bytes)
 
 
-def convert_file(igc_path, color_kml, output_path=None):
+def convert_file(igc_path, color_kml, output_path=None, tolerance_m=0):
     """Convert a single IGC file to KMZ. Returns (output_path, error_or_None)."""
     name = os.path.splitext(os.path.basename(igc_path))[0]
     if output_path is None:
@@ -159,6 +209,8 @@ def convert_file(igc_path, color_kml, output_path=None):
         data = parse_igc(igc_path)
         if not data["points"]:
             return output_path, "No valid GPS fixes found"
+        if tolerance_m > 0:
+            data["points"] = simplify_track(data["points"], tolerance_m)
         kml_tree = build_kml(data, name, color_kml)
         write_kmz(kml_tree, output_path)
         return output_path, None
@@ -197,6 +249,26 @@ def pick_color_macos():
     g = int(parts[1].strip()) // 256
     b = int(parts[2].strip()) // 256
     return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def pick_tolerance_macos():
+    """Ask user for track simplification tolerance via AppleScript. Returns float or None."""
+    script = (
+        'display dialog "Simplify tracks? Enter tolerance in meters (0 = no simplification):" '
+        'default answer "10" '
+        'with title "Track Simplification"'
+    )
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    # Output: "button returned:OK, text returned:10"
+    for part in result.stdout.strip().split(","):
+        if "text returned:" in part:
+            try:
+                return float(part.split("text returned:")[1].strip())
+            except ValueError:
+                return None
+    return None
 
 
 def show_alert_macos(title, message):
@@ -324,7 +396,7 @@ def convert_folder(folder_path):
     show_alert_macos("Conversion Complete", msg)
 
 
-def merge_kmz_folder(folder_path):
+def merge_kmz_folder(folder_path, tolerance_m=0):
     """Merge all KMZ files in subfolders into a single combined KMZ."""
     folder_path = folder_path.rstrip("/")
     folder_name = os.path.basename(folder_path)
@@ -402,6 +474,23 @@ def merge_kmz_folder(folder_path):
                     style_url.text = "#" + file_prefix + style_url.text[1:]
                 folder_el.append(pm)
 
+                # Simplify track coordinates if tolerance is set
+                if tolerance_m > 0:
+                    ls = pm.find(f"{{{ns}}}LineString")
+                    if ls is not None:
+                        coords_el = ls.find(f"{{{ns}}}coordinates")
+                        if coords_el is not None and coords_el.text:
+                            points = []
+                            for triplet in coords_el.text.strip().split():
+                                parts = triplet.split(",")
+                                if len(parts) >= 3:
+                                    points.append((float(parts[1]), float(parts[0]), float(parts[2])))
+                            if len(points) > 2:
+                                simplified = simplify_track(points, tolerance_m)
+                                coords_el.text = " ".join(
+                                    f"{lon},{lat},{alt}" for lat, lon, alt in simplified
+                                )
+
     output_path = os.path.join(parent_dir, folder_name + "_merged.kmz")
     kml_tree = ET.ElementTree(kml)
     write_kmz(kml_tree, output_path)
@@ -421,7 +510,10 @@ def main():
         folder = pick_folder_macos()
         if not folder:
             sys.exit(0)
-        merge_kmz_folder(folder)
+        tolerance = pick_tolerance_macos()
+        if tolerance is None:
+            sys.exit(0)
+        merge_kmz_folder(folder, tolerance_m=tolerance)
     elif mode == "folder":
         folder = pick_folder_macos()
         if not folder:
@@ -438,11 +530,15 @@ def main():
             sys.exit(0)
         color_kml = rgb_hex_to_kml(hex_color)
 
+        tolerance = pick_tolerance_macos()
+        if tolerance is None:
+            sys.exit(0)
+
         success = 0
         errors = []
         for i, f in enumerate(files, 1):
             print(f"[{i}/{len(files)}] Converting {os.path.basename(f)}...")
-            out, err = convert_file(f, color_kml)
+            out, err = convert_file(f, color_kml, tolerance_m=tolerance)
             if err:
                 errors.append(f"{os.path.basename(f)}: {err}")
                 print(f"  ERROR: {err}")
